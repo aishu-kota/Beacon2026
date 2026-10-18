@@ -41,6 +41,9 @@ let textbeeStatus = "idle";
 let textbeeDevice = "";
 let textbeeDeviceId = "";
 let replyNote = "";
+let replyNotes = {};
+let textbeeError = "";
+let receiveSmsOn = null;
 let polling = false;
 
 const $app = document.getElementById("app");
@@ -169,12 +172,22 @@ function esc(value) {
     .replace(/"/g, "&quot;");
 }
 
+const YES_WORDS = new Set(["yes", "y", "yeah", "yep", "yup", "ok", "okay", "confirm", "confirmed", "agree", "iagree"]);
+const NO_WORDS = new Set(["no", "n", "nope", "nah", "decline", "declined", "stop", "stopall", "unsubscribe", "cancel", "quit"]);
+
 function classifyReply(body) {
-  const token = String(body || "").trim().toLowerCase().replace(/[^a-z]/g, "");
-  if (!token) return "other";
-  if (["stop", "stopall", "unsubscribe", "cancel", "quit"].includes(token)) return "no";
-  if (token.startsWith("yes") || ["y", "yeah", "yep", "yup", "ok", "okay", "confirm", "confirmed", "agree", "iagree"].includes(token)) return "yes";
-  if (token.startsWith("no") || ["n", "nope", "nah", "decline", "declined"].includes(token)) return "no";
+  const text = String(body || "").replace(/\u00a0/g, " ").trim().toLowerCase();
+  if (!text) return "other";
+  // The consent text itself contains both YES and NO. An echo of that text is not a reply.
+  if (text.includes("emergency contact") && /reply\s+yes/.test(text) && /\bno\b/.test(text)) return "other";
+  const words = text.replace(/[^a-z]+/g, " ").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return "other";
+  if (NO_WORDS.has(words[0])) return "no";
+  if (YES_WORDS.has(words[0])) return "yes";
+  const hasYes = words.some((word) => YES_WORDS.has(word));
+  const hasNo = words.some((word) => NO_WORDS.has(word));
+  if (hasYes && !hasNo) return "yes";
+  if (hasNo && !hasYes) return "no";
   return "other";
 }
 
@@ -199,6 +212,8 @@ async function testTextbee() {
     textbeeStatus = "idle";
     textbeeError = "";
     textbeeDevice = "";
+    textbeeDeviceId = "";
+    receiveSmsOn = null;
     return;
   }
   textbeeStatus = "checking";
@@ -214,9 +229,11 @@ async function testTextbee() {
       const online = list.find((d) => d.enabled) || list[0];
       textbeeDevice = online ? (online.name || online.model || "your phone") : "";
       textbeeDeviceId = online ? (online._id || online.id || "") : "";
+      receiveSmsOn = online && typeof online.receiveSMSEnabled === "boolean" ? Boolean(online.receiveSMSEnabled) : null;
     } catch {
       textbeeDevice = "";
       textbeeDeviceId = "";
+      receiveSmsOn = null;
     }
     toast(textbeeDevice ? `TextBee connected. Texts send from ${textbeeDevice} to any number.` : "TextBee connected. Texts send from your phone.");
     void pollReplies();
@@ -224,6 +241,8 @@ async function testTextbee() {
     textbeeStatus = "error";
     textbeeError = err.message || "Couldn't reach TextBee.";
     textbeeDevice = "";
+    textbeeDeviceId = "";
+    receiveSmsOn = null;
   }
   render();
 }
@@ -240,25 +259,72 @@ function samePhone(a, b) {
   const da = String(a || "").replace(/\D/g, "");
   const db = String(b || "").replace(/\D/g, "");
   if (da.length < 7 || db.length < 7) return false;
-  const n = Math.min(10, da.length, db.length);
-  return da.slice(-n) === db.slice(-n);
+  const [shorter, longer] = da.length <= db.length ? [da, db] : [db, da];
+  const tail = shorter.length > 10 ? shorter.slice(-10) : shorter;
+  return longer.endsWith(tail);
 }
 
 function messageText(row) {
-  return String(row?.message || row?.body || row?.text || row?.content || "");
-}
-
-function messageSender(row) {
-  const raw = row?.sender ?? row?.from ?? row?.address ?? row?.phoneNumber ?? "";
-  if (raw && typeof raw === "object") return String(raw.phone || raw.number || raw.address || "");
+  const raw = row?.message ?? row?.body ?? row?.text ?? row?.content ?? row?.smsBody ?? "";
+  if (raw && typeof raw === "object") return String(raw.body || raw.text || raw.content || "");
   return String(raw);
 }
 
+function phoneString(raw) {
+  if (raw && typeof raw === "object") return String(raw.phone || raw.number || raw.address || raw.msisdn || "");
+  return String(raw || "");
+}
+
+function messageSender(row) {
+  return phoneString(row?.sender ?? row?.from ?? row?.address ?? row?.phoneNumber ?? row?.senderPhone ?? row?.msisdn ?? "");
+}
+
+function coerceTime(raw) {
+  if (raw && typeof raw === "object") {
+    if (raw.$date != null) return coerceTime(raw.$date);
+    if (raw.date != null) return coerceTime(raw.date);
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw < 1e12 ? raw * 1000 : raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return 0;
+    if (/^\d+$/.test(trimmed)) {
+      const value = Number(trimmed);
+      return value < 1e12 ? value * 1000 : value;
+    }
+    const parsed = Date.parse(trimmed);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
 function messageTime(row) {
-  const raw = row?.receivedAt ?? row?.receivedAtInMillis ?? row?.createdAt ?? row?.date ?? 0;
-  if (typeof raw === "number") return raw < 1e12 ? raw * 1000 : raw;
-  const parsed = Date.parse(raw);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return coerceTime(row?.receivedAt ?? row?.receivedAtInMillis ?? row?.createdAt ?? row?.date ?? row?.timestamp ?? 0);
+}
+
+function latestTime(row) {
+  return Math.max(
+    coerceTime(row?.receivedAt),
+    coerceTime(row?.receivedAtInMillis),
+    coerceTime(row?.createdAt),
+    coerceTime(row?.originalCreatedAt),
+    coerceTime(row?.date),
+    coerceTime(row?.timestamp),
+  );
+}
+
+function isIncoming(row) {
+  const dir = String(row?.direction || row?.type || row?.smsType || "").toLowerCase();
+  if (dir === "sent" || dir === "outbound" || dir === "outgoing") return false;
+  if (dir === "received" || dir === "inbound" || dir === "incoming") return true;
+  if (row?.sender && (row.receivedAt || row.receivedAtInMillis)) return true;
+  if (row?.recipient && !row?.sender) return false;
+  return Boolean(row?.sender);
+}
+
+function rowMatchesContact(row, contact) {
+  const candidates = [messageSender(row), row?.recipient, row?.phone, row?.address];
+  return candidates.some((value) => samePhone(phoneString(value), contact.phone));
 }
 
 function rowsFrom(res) {
@@ -266,39 +332,117 @@ function rowsFrom(res) {
   if (Array.isArray(res?.data)) return res.data;
   if (Array.isArray(res?.data?.data)) return res.data.data;
   if (Array.isArray(res?.data?.messages)) return res.data.messages;
+  if (Array.isArray(res?.data?.items)) return res.data.items;
   if (Array.isArray(res?.messages)) return res.messages;
   if (Array.isArray(res?.data?.sms)) return res.data.sms;
+  if (Array.isArray(res?.items)) return res.items;
   return [];
 }
 
-async function loadInbox() {
-  const chunks = [];
-  let error = "";
+function messagesPath(params) {
+  const query = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
+  });
+  return "/gateway/messages?" + query.toString();
+}
+
+function rememberRows(bucket, rows) {
+  rows.forEach((row) => {
+    if (!row || typeof row !== "object") return;
+    const id = row._id || row.id || `${messageSender(row)}|${latestTime(row)}|${messageText(row)}`;
+    if (!bucket.has(String(id))) bucket.set(String(id), row);
+  });
+}
+
+async function pullMessages(bucket, params) {
+  const res = await textbee(messagesPath(params));
+  rememberRows(bucket, rowsFrom(res));
+  const meta = res?.meta || res?.data?.meta;
+  if (meta?.hasMore && Number(meta.page) === 1) {
+    try {
+      const next = await textbee(messagesPath({ ...params, page: 2 }));
+      rememberRows(bucket, rowsFrom(next));
+    } catch {
+      /* The first page is still usable. */
+    }
+  }
+}
+
+async function loadInbox(contacts) {
+  const bucket = new Map();
+  const errors = [];
+  const asked = contacts.filter((contact) => contact.phone && contact.consentRequestedAt);
+  const earliest = asked.reduce((min, contact) => Math.min(min, Number(contact.consentRequestedAt) || min), Date.now());
+  const from = new Date(earliest - 24 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+
   try {
-    chunks.push(...rowsFrom(await textbee("/gateway/messages?direction=received&limit=50")));
+    await pullMessages(bucket, { direction: "received", limit: 100, order: "desc", from });
   } catch (err) {
-    error = err.message || "Couldn't read replies.";
-  }
-  if (!chunks.length && textbeeDeviceId) {
+    errors.push(err.message || "Couldn't read replies.");
     try {
-      chunks.push(...rowsFrom(await textbee("/gateway/devices/" + textbeeDeviceId + "/get-received-sms?limit=50")));
-    } catch (err) {
-      error = error || err.message || "Couldn't read replies.";
+      await pullMessages(bucket, { limit: 100, order: "desc" });
+    } catch (fallbackErr) {
+      errors.push(fallbackErr.message || "Couldn't read replies.");
     }
   }
-  if (!chunks.length) {
+
+  for (const contact of asked) {
+    const digits = String(contact.phone).replace(/\D/g, "");
+    const needle = digits.length > 10 ? digits.slice(-10) : digits;
+    if (needle.length < 7) continue;
     try {
-      const all = rowsFrom(await textbee("/gateway/messages?limit=50"));
-      chunks.push(...all.filter((row) => {
-        const dir = String(row.direction || row.type || "").toLowerCase();
-        return dir === "received" || dir === "inbound" || (!dir && messageSender(row));
-      }));
+      await pullMessages(bucket, { direction: "received", limit: 20, search: needle });
     } catch (err) {
-      error = error || err.message || "Couldn't read replies.";
+      errors.push(err.message || "Couldn't read replies.");
+      try {
+        await pullMessages(bucket, { limit: 20, search: needle });
+      } catch (fallbackErr) {
+        errors.push(fallbackErr.message || "Couldn't read replies.");
+      }
     }
   }
-  if (!chunks.length && error) throw new Error(error);
-  return chunks;
+
+  if (!bucket.size && textbeeDeviceId) {
+    try {
+      rememberRows(bucket, rowsFrom(await textbee("/gateway/devices/" + encodeURIComponent(textbeeDeviceId) + "/get-received-sms?limit=100")));
+    } catch (err) {
+      errors.push(err.message || "Couldn't read replies.");
+    }
+  }
+
+  if (!bucket.size && errors.length) throw new Error(errors[0]);
+  return [...bucket.values()];
+}
+
+function matchConsent(contact, rows) {
+  const requested = Number(contact.consentRequestedAt) || 0;
+  const start = requested - 30 * 60 * 1000;
+  const hits = rows.filter((row) => {
+    if (!isIncoming(row)) return false;
+    const verdict = classifyReply(messageText(row));
+    if (verdict !== "yes" && verdict !== "no") return false;
+    if (!rowMatchesContact(row, contact)) return false;
+    const when = latestTime(row);
+    return !when || when >= start;
+  });
+  hits.sort((a, b) => latestTime(b) - latestTime(a));
+  return hits[0] || null;
+}
+
+function pendingReplyNote(contact, rows) {
+  const phone = formatPhone(contact.phone);
+  if (receiveSmsOn === false) {
+    return `Turn on Receive SMS in the TextBee app. Until then, a YES or NO from ${phone} cannot update this page.`;
+  }
+  const requested = Number(contact.consentRequestedAt) || 0;
+  const fromContact = rows.filter((row) => isIncoming(row) && rowMatchesContact(row, contact) && (!latestTime(row) || latestTime(row) >= requested - 30 * 60 * 1000));
+  if (fromContact.some((row) => row.encrypted === true && !messageText(row).trim())) {
+    return `TextBee encrypted the reply from ${phone}, so Safely cannot read YES or NO. Turn off end-to-end encryption and ask them to text again.`;
+  }
+  if (fromContact.length) return `${contact.name} texted, but it was not YES or NO. Ask them to reply with just YES or NO.`;
+  if (!rows.length) return `No reply from ${phone} yet. TextBee has not delivered an incoming text.`;
+  return `Waiting for a YES or NO from ${phone}.`;
 }
 
 async function pollReplies() {
@@ -307,51 +451,44 @@ async function pollReplies() {
   if (!asked.length) return;
   polling = true;
   try {
-    const previousNote = replyNote;
-    const rows = await loadInbox();
-    const ordered = [...asked].sort((a, b) => a.consentRequestedAt - b.consentRequestedAt);
+    const previousNotes = JSON.stringify(replyNotes);
+    const rows = await loadInbox(asked);
     let changed = false;
-    for (const contact of ordered) {
-      const next = ordered.find((other) => other.consentRequestedAt > contact.consentRequestedAt);
-      const start = contact.consentRequestedAt - 2 * 60 * 1000;
-      const end = next ? next.consentRequestedAt : Infinity;
-      const replies = rows.filter((row) => {
-        const verdict = classifyReply(messageText(row));
-        if (verdict !== "yes" && verdict !== "no") return false;
-        const at = messageTime(row);
-        const ownNumber = samePhone(messageSender(row), contact.phone);
-        if (ownNumber) return !at || at >= start;
-        if (!at || at < start || at >= end) return false;
-        return !ordered.some((other) => other !== contact && samePhone(messageSender(row), other.phone));
-      });
-      replies.sort((a, b) => messageTime(b) - messageTime(a));
-      const match = replies[0];
+    const updates = [];
+    const nextNotes = {};
+    for (const contact of asked) {
+      const match = matchConsent(contact, rows);
       if (!match) {
-        if (contact.consent === "yes" && rows.length) {
-          contact.consent = "pending";
-          changed = true;
-          replyNote = `Waiting for a YES or NO from ${formatPhone(contact.phone)}. Another contact's reply does not count.`;
-        } else if (contact.consent === "pending") {
-          replyNote = `Waiting for a YES or NO from ${formatPhone(contact.phone)}.`;
-        }
+        if (contact.consent === "pending") nextNotes[contact.id] = pendingReplyNote(contact, rows);
         continue;
       }
       const verdict = classifyReply(messageText(match));
       if (contact.consent !== verdict) {
         contact.consent = verdict;
         changed = true;
-        replyNote = "";
-        toast(verdict === "yes" ? `${contact.name} opted in.` : `${contact.name} declined and will not be texted.`);
+        updates.push(verdict === "yes" ? `${contact.name} opted in.` : `${contact.name} declined and will not be texted.`);
       }
     }
+    replyNotes = nextNotes;
+    replyNote = Object.values(nextNotes)[0] || "";
     if (changed) save();
-    else if (replyNote !== previousNote) render();
+    if (updates.length) toast(updates.join(" "));
+    else if (JSON.stringify(replyNotes) !== previousNotes) render();
   } catch (err) {
     replyNote = err.message || "Couldn't check replies.";
+    askedNotesOnError(replyNote);
     render();
   } finally {
     polling = false;
   }
+}
+
+function askedNotesOnError(message) {
+  const nextNotes = {};
+  state.contacts.forEach((contact) => {
+    if (contact.consent === "pending") nextNotes[contact.id] = message;
+  });
+  replyNotes = nextNotes;
 }
 
 function toast(text) {
@@ -493,7 +630,11 @@ function textbeeCard() {
         <button class="btn secondary" type="submit">${state.textbeeKey ? "Update key" : "Connect"}</button>
         ${state.textbeeKey ? `<button class="btn quiet" type="button" id="clear-key">Disconnect</button>` : ""}
       </div>
-      <p class="faint">${textbeeStatus === "ok" ? `Connected${textbeeDevice ? ` to ${esc(textbeeDevice)}` : ""}. Real texts go to the number you add.` : textbeeStatus === "error" ? esc(textbeeError) : "Paste your TextBee API key. Not Twilio."}</p>
+      <p class="faint">${textbeeStatus === "ok"
+        ? (receiveSmsOn === false
+          ? "Connected for sending, but Receive SMS is off. Turn it on in the TextBee Android app, or a YES or NO reply will not update here."
+          : `Connected${textbeeDevice ? ` to ${esc(textbeeDevice)}` : ""}. Real texts go to the number you add.`)
+        : textbeeStatus === "error" ? esc(textbeeError) : "Paste your TextBee API key. Not Twilio."}</p>
     </form>
   `;
 }
@@ -524,7 +665,7 @@ function contactList() {
         <button class="btn quiet small" data-del="${c.id}">Remove</button>
       </div>
     </div>
-        ${c.consent === "pending" ? `<p class="hint" style="margin-top:8px">${esc(replyNote || "Waiting for her text. Replies are checked every few seconds.")}</p><button class="btn secondary small check-replies" type="button" style="margin-top:8px">Check for her reply</button>` : ""}
+        ${c.consent === "pending" ? `<p class="hint" style="margin-top:8px">${esc(replyNotes[c.id] || replyNote || "Waiting for a YES or NO. Replies are checked every few seconds.")}</p><button class="btn secondary small check-replies" type="button" style="margin-top:8px">Check for her reply</button>` : ""}
   `).join("");
 }
 
@@ -668,6 +809,9 @@ function bind() {
     state.textbeeKey = "";
     textbeeStatus = "idle";
     textbeeError = "";
+    textbeeDevice = "";
+    textbeeDeviceId = "";
+    receiveSmsOn = null;
     save();
     toast("TextBee disconnected. Rehearsal mode.");
   });
